@@ -1,84 +1,168 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"log"
 	"os"
 	"strconv"
+	"strings"
 
-	"github.com/timohirt/terraform-provider-hetznerdns/hetznerdns/api"
+	hetzner_dns "github.com/panta/go-hetzner-dns"
 )
+
+type record struct {
+	name           string
+	rrType         string
+	value          string
+	ttl            int
+	deleteExisting bool
+}
+
+func (rec record) String() string {
+	return fmt.Sprintf("%s %d %s %s", rec.name, rec.ttl, rec.rrType, rec.value)
+}
+
+const (
+	recordEnvPrefix = "DNS_RECORD_"
+)
+
+func getRecordDefinitions() []record {
+	lm := make(map[string]*record)
+
+	for _, env := range os.Environ() {
+		if strings.HasPrefix(env, recordEnvPrefix) {
+			parts := strings.SplitN(env, "=", 2)
+			envName, envValue := parts[0], parts[1]
+
+			envNameParts := strings.Split(envName, "_")
+			if len(envNameParts) != 4 {
+				log.Printf("invalid number of parts in environment variable name %s\n", envName)
+				continue
+			}
+
+			recordIndex := envNameParts[2]
+
+			if _, ok := lm[recordIndex]; !ok {
+				lm[recordIndex] = new(record)
+			}
+
+			switch envNameParts[3] {
+			case "NAME":
+				envValue = strings.TrimSuffix(envValue, ".")
+				lm[recordIndex].name = envValue
+			case "TYPE":
+				lm[recordIndex].rrType = envValue
+			case "VALUE":
+				lm[recordIndex].value = envValue
+			case "TTL":
+				ttl, err := strconv.ParseInt(envValue, 0, 0)
+				if err != nil {
+					log.Printf("invalid value for record ttl: %q", envValue)
+					continue
+				}
+
+				lm[recordIndex].ttl = int(ttl)
+			case "OVERWRITE":
+				val, err := strconv.ParseBool(envValue)
+				if err != nil {
+					log.Printf("invalid value for overwrite: %s", envValue)
+				}
+
+				lm[recordIndex].deleteExisting = val
+			}
+		}
+	}
+
+	result := make([]record, 0, len(lm))
+	for _, rec := range lm {
+		result = append(result, *rec)
+	}
+
+	return result
+}
 
 func main() {
 	var (
 		apiToken    = getRequiredEnv("HETZNER_DNS_API_TOKEN")
 		dnsZoneName = getRequiredEnv("DNS_ZONE_NAME")
-		dnsRecord   = getRequiredEnv("DNS_RECORD_NAME")
-		dnsType     = getRequiredEnv("DNS_RECORD_TYPE")
-		dnsValue    = getRequiredEnv("DNS_RECORD_VALUE")
-		dnsTTL      = getRequiredEnv("DNS_RECORD_TTL")
 	)
 
-	ttl64, err := strconv.ParseInt(dnsTTL, 0, 0)
-	if err != nil {
-		log.Fatalf("DNS_RECORD_TTL: invalid value. expected a number")
-	}
-	ttl := int(ttl64)
+	ctx := context.Background()
 
-	cli, err := api.NewClient(apiToken)
-	if err != nil {
-		log.Fatalf("failed to create API client: %s", err)
+	records := getRecordDefinitions()
+	if len(records) == 0 {
+		log.Printf("no record definitions found")
+		return
 	}
 
-	zone, err := cli.GetZoneByName(dnsZoneName)
+	cli := &hetzner_dns.Client{ApiKey: apiToken}
+
+	zones, err := cli.GetZones(ctx, dnsZoneName, "", 1, 100)
 	if err != nil {
 		log.Fatalf("failed to get zone by name: %s", err)
 	}
 
-	log.Printf("%s: zone ID %s", zone.Name, zone.ID)
-
-	existingRecord, err := cli.GetRecordByName(zone.ID, dnsRecord)
-	if err != nil {
-		// TODO(ppacher): create PR for timohirt/terraform-provider-hetznerdns so
-		// we get the status code out of it?
-		log.Printf("failed to get record by name: %s", err)
-
-		_, err := cli.CreateRecord(api.CreateRecordOpts{
-			ZoneID: zone.ID,
-			Type:   dnsType,
-			Name:   dnsRecord,
-			Value:  dnsValue,
-			TTL:    &ttl,
-		})
+	if len(zones.Zones) == 0 {
+		allZones, err := cli.GetZones(ctx, "", "", 1, 100)
 		if err != nil {
-			log.Fatalf("failed to create record: %s", err)
+			log.Fatal("failed to get all DNS zones")
 		}
-		return
-	}
 
-	log.Printf("record ID for %s is %s, updating...", existingRecord.Name, existingRecord.ID)
-	if existingRecord.Type == dnsType {
-		existingRecord.TTL = &ttl
-		existingRecord.Value = dnsValue
-
-		if _, err := cli.UpdateRecord(*existingRecord); err != nil {
-			log.Fatalf("failed to update record: %s", err)
+		if len(allZones.Zones) == 0 {
+			log.Printf("no dns zone available\n")
 		}
-		return
+
+		for _, z := range allZones.Zones {
+			log.Printf("available zone: id=%s name=%s\n", z.ID, z.Name)
+		}
+
+		log.Fatalf("configured DNS zone %q does not exist", dnsZoneName)
 	}
 
-	// changing the DNS type is not supported so we need to destroy
-	// and re-create the record
-	if err := cli.DeleteRecord(existingRecord.ID); err != nil {
-		log.Fatalf("failed to delete existing record with ID %s: %s", existingRecord.ID, err)
+	log.Printf("%s: zone ID %s", zones.Zones[0].Name, zones.Zones[0].ID)
+
+	existingRecords, err := cli.GetRecords(ctx, zones.Zones[0].ID, 0, 0)
+	if err != nil {
+		log.Fatalf("failed to get zone records: %s", err)
 	}
-	if _, err := cli.CreateRecord(api.CreateRecordOpts{
-		ZoneID: zone.ID,
-		Type:   dnsType,
-		Name:   dnsRecord,
-		Value:  dnsValue,
-		TTL:    &ttl,
-	}); err != nil {
-		log.Fatalf("failed to create record: %s", err)
+
+	// build a simple lookup map indexed by "<NAME> <TYPE>"
+	lm := make(map[string][]hetzner_dns.Record)
+	for _, e := range existingRecords.Records {
+		key := fmt.Sprintf("%s %s", e.Name, e.Type)
+		lm[key] = append(lm[key], e)
+
+		log.Printf("found existing records: %s %s %d %s %s\n", e.ID, e.Name, e.TTL, e.Type, e.Value)
+	}
+
+	for _, rec := range records {
+		key := fmt.Sprintf("%s %s", rec.name, rec.rrType)
+		existing := lm[key]
+
+		if rec.deleteExisting {
+			for _, e := range existing {
+				log.Printf("deleting existing record %s: %s %s %s\n", e.ID, e.Name, e.Type, e.Value)
+				if err := cli.DeleteRecord(ctx, e.ID); err != nil {
+					log.Printf("failed to delete record %s", e.ID)
+				}
+			}
+
+			// reset so we don't try to delete them again
+			lm[key] = nil
+		}
+
+		log.Printf("creating record %s\n", rec.String())
+
+		if _, err := cli.CreateOrUpdateRecord(ctx, hetzner_dns.RecordRequest{
+			ZoneID: zones.Zones[0].ID,
+			Type:   rec.rrType,
+			Name:   rec.name,
+			Value:  rec.value,
+			TTL:    rec.ttl,
+		}); err != nil {
+			log.Printf("failed to create record: %s\n", err)
+		}
 	}
 }
 

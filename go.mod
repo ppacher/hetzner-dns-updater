@@ -14,6 +14,7 @@ require (
 	github.com/fatih/color v1.7.0 // indirect
 	github.com/golang/protobuf v1.3.4 // indirect
 	github.com/google/go-cmp v0.3.1 // indirect
+	github.com/google/go-querystring v1.0.0 // indirect
 	github.com/google/uuid v1.1.1 // indirect
 	github.com/googleapis/gax-go/v2 v2.0.5 // indirect
 	github.com/hashicorp/errwrap v1.0.0 // indirect
@@ -41,6 +42,8 @@ require (
 	github.com/mitchellh/mapstructure v1.1.2 // indirect
 	github.com/mitchellh/reflectwalk v1.0.1 // indirect
 	github.com/oklog/run v1.0.0 // indirect
+	github.com/panta/go-hetzner-dns v0.0.0-20210217122151-0df462200341 // indirect
+	github.com/pkg/errors v0.9.1 // indirect
 	github.com/posener/complete v1.2.1 // indirect
 	github.com/spf13/afero v1.2.2 // indirect
 	github.com/timohirt/terraform-provider-hetznerdns v1.2.0 // indirect
